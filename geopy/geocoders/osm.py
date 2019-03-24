@@ -49,7 +49,7 @@ class Nominatim(Geocoder):
             domain=_DEFAULT_NOMINATIM_DOMAIN,
             scheme=None,
             user_agent=None,
-            ssl_context=DEFAULT_SENTINEL,
+            ssl_context=DEFAULT_SENTINEL
             # Make sure to synchronize the changes of this signature in the
             # inheriting classes (e.g. PickPoint).
     ):
@@ -131,7 +131,7 @@ class Nominatim(Geocoder):
             viewbox=None,
             bounded=False,
             featuretype=None,
-            namedetails=False,
+            namedetails=False
     ):
         """
         Return a location point by address.
