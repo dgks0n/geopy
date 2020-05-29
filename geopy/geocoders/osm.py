@@ -49,7 +49,6 @@ class Nominatim(Geocoder):
 
     def __init__(
             self,
-            format_string=None,
             view_box=None,
             bounded=None,
             country_bias=None,
@@ -63,10 +62,6 @@ class Nominatim(Geocoder):
             # inheriting classes (e.g. PickPoint).
     ):
         """
-        :param str format_string:
-            See :attr:`geopy.geocoders.options.default_format_string`.
-
-            .. deprecated:: 1.22.0
 
         :type view_box: list or tuple of 2 items of :class:`geopy.point.Point` or
             ``(latitude, longitude)`` or ``"%(latitude)s, %(longitude)s"``.
@@ -132,7 +127,6 @@ class Nominatim(Geocoder):
 
         """
         super().__init__(
-            format_string=format_string,
             scheme=scheme,
             timeout=timeout,
             proxies=proxies,
@@ -325,7 +319,7 @@ class Nominatim(Geocoder):
                 if key in self.structured_query_params
             }
         else:
-            params = {'q': self.format_string % query}
+            params = {'q': query}
 
         params.update({
             'format': 'json'
