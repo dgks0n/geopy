@@ -320,10 +320,6 @@ async def test_system_proxies_are_respected_by_default(
     adapter_factory,
     proxy_url,
 ):
-    if "://" not in proxy_url and adapter_factory is AioHTTPAdapter:
-        # ValueError: Only http proxies are supported
-        pytest.xfail("aiohttp requires schema in proxy urls")
-
     async with make_dummy_async_geocoder(timeout=timeout) as geocoder_dummy:
         assert 0 == len(proxy_server.requests)
         await geocoder_dummy.geocode(remote_website_http)
@@ -338,10 +334,6 @@ async def test_system_proxies_are_respected_with_none(
     adapter_factory,
     proxy_url,
 ):
-    if "://" not in proxy_url and adapter_factory is AioHTTPAdapter:
-        # ValueError: Only http proxies are supported
-        pytest.xfail("aiohttp requires schema in proxy urls")
-
     # proxies=None means "use system proxies", e.g. from the ENV.
     async with make_dummy_async_geocoder(
         proxies=None, timeout=timeout
