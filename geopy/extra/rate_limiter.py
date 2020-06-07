@@ -1,3 +1,6 @@
+import asyncio
+import inspect
+import threading
 from itertools import chain, count
 from time import sleep
 from timeit import default_timer
@@ -5,13 +8,111 @@ from timeit import default_timer
 from geopy.exc import GeocoderServiceError
 from geopy.util import logger
 
+__all__ = ("AsyncRateLimiter", "RateLimiter")
+
 
 def _is_last_gen(count):
     """list(_is_last_gen(2)) -> [False, False, True]"""
     return chain((False for _ in range(count)), [True])
 
 
-class RateLimiter:
+class BaseRateLimiter:
+    """Base Rate Limiter class for both sync and async versions."""
+
+    _retry_exceptions = (GeocoderServiceError,)
+
+    def __init__(
+        self,
+        *,
+        min_delay_seconds,
+        max_retries,
+        swallow_exceptions,
+        return_value_on_exception
+    ):
+        self.min_delay_seconds = min_delay_seconds
+        self.max_retries = max_retries
+        self.swallow_exceptions = swallow_exceptions
+        self.return_value_on_exception = return_value_on_exception
+        assert max_retries >= 0
+
+        # State:
+        self._lock = threading.Lock()
+        self._last_call = None
+
+    def _clock(self):  # pragma: no coverage
+        return default_timer()
+
+    def _acquire_request_slot_gen(self):
+        # Requests rate is limited by `min_delay_seconds` interval.
+        #
+        # Imagine the time axis as a grid with `min_delay_seconds` step,
+        # where we would call each step as a "request slot". RateLimiter
+        # guarantees that each "request slot" contains at most 1 request.
+        #
+        # Note that actual requests might take longer time than
+        # `min_delay_seconds`. In that case you might want to consider
+        # parallelizing requests (with a ThreadPool for sync mode and
+        # asyncio tasks for async), to keep the requests rate closer
+        # to `min_delay_seconds`.
+        #
+        # This generator thread-safely acquires a "request slot", and
+        # if it fails to do that at this time, it yields the amount
+        # of seconds to sleep until the next attempt. The generator
+        # is stopped only when the "request slot" has been successfully
+        # acquired.
+        #
+        # There's no ordering between the concurrent requests. The first
+        # request to acquire the lock wins the next "request slot".
+        while True:
+            with self._lock:
+                clock = self._clock()
+                if self._last_call is None:
+                    # A first iteration -- start immediately.
+                    self._last_call = clock
+                    return
+                seconds_since_last_call = clock - self._last_call
+                wait = self.min_delay_seconds - seconds_since_last_call
+                if wait <= 0:
+                    # A successfully acquired request slot.
+                    self._last_call = clock
+                    return
+            # Couldn't acquire a request slot. Wait until the beginning
+            # of the next slot to try again.
+            yield wait
+
+    def _retries_gen(self, args, kwargs):
+        for i, is_last_try in zip(count(), _is_last_gen(self.max_retries)):
+            try:
+                yield i  # Run the function.
+            except self._retry_exceptions:
+                if is_last_try:
+                    yield True  # The exception should be raised
+                else:
+                    logger.warning(
+                        type(self).__name__ + ' caught an error, retrying '
+                        '(%s/%s tries). Called with (*%r, **%r).',
+                        i, self.max_retries, args, kwargs,
+                        exc_info=True
+                    )
+                    yield False  # The exception has been swallowed.
+                    continue
+            else:
+                return  # A successful run -- stop retrying.
+
+    def _handle_exc(self, args, kwargs):
+        if self.swallow_exceptions:
+            logger.warning(
+                type(self).__name__ + ' swallowed an error after %r retries. '
+                'Called with (*%r, **%r).',
+                self.max_retries, args, kwargs,
+                exc_info=True
+            )
+            return self.return_value_on_exception
+        else:
+            raise
+
+
+class RateLimiter(BaseRateLimiter):
     """RateLimiter allows to perform bulk operations while gracefully
     handling error responses and adding delays when needed.
 
@@ -59,6 +160,9 @@ class RateLimiter:
     Before using this class, please consult with the Geocoding service
     ToS, which might explicitly consider bulk requests (even throttled)
     a violation.
+
+    XXX asyncio
+    XXX no concurrency
     """
 
     def __init__(self, func, min_delay_seconds=0.0, max_retries=2,
@@ -91,54 +195,79 @@ class RateLimiter:
             Value to return on failure when ``swallow_exceptions=True``.
 
         """
+        super().__init__(
+            min_delay_seconds=min_delay_seconds,
+            max_retries=max_retries,
+            swallow_exceptions=swallow_exceptions,
+            return_value_on_exception=return_value_on_exception,
+        )
         self.func = func
-        self.min_delay_seconds = min_delay_seconds
-        self.max_retries = max_retries
         self.error_wait_seconds = error_wait_seconds
-        self.swallow_exceptions = swallow_exceptions
-        self.return_value_on_exception = return_value_on_exception
         assert error_wait_seconds >= min_delay_seconds
         assert max_retries >= 0
 
-        self._last_call = self._clock() - min_delay_seconds
-
-    def _clock(self):  # pragma: no coverage
-        return default_timer()
-
     def _sleep(self, seconds):  # pragma: no coverage
-        logger.debug('RateLimiter sleep(%r)', seconds)
+        logger.debug(type(self).__name__ + ' sleep(%r)', seconds)
         sleep(seconds)
 
-    def _sleep_between(self):
-        seconds_since_last_call = self._clock() - self._last_call
-        wait = self.min_delay_seconds - seconds_since_last_call
-        if wait > 0:
+    def _acquire_request_slot(self):
+        for wait in self._acquire_request_slot_gen():
             self._sleep(wait)
 
     def __call__(self, *args, **kwargs):
-        self._sleep_between()
-
-        for i, is_last_try in zip(count(), _is_last_gen(self.max_retries)):
+        gen = self._retries_gen(args, kwargs)
+        for _ in gen:
+            self._acquire_request_slot()
             try:
-                return self.func(*args, **kwargs)
-            except GeocoderServiceError:
-                if not is_last_try:
-                    logger.warning(
-                        'RateLimiter caught an error, retrying '
-                        '(%s/%s tries). Called with (*%r, **%r).',
-                        i, self.max_retries, args, kwargs, exc_info=True
+                res = self.func(*args, **kwargs)
+                if inspect.isawaitable(res):
+                    raise ValueError(
+                        "An async awaitable has been passed to `RateLimiter`. "
+                        "Use `AsyncRateLimiter` instead, which supports awaitables."
                     )
-                    self._sleep(self.error_wait_seconds)
-                    continue
+                return res
+            except self._retry_exceptions as e:
+                if gen.throw(e):
+                    # A final try
+                    return self._handle_exc(args, kwargs)
+                self._sleep(self.error_wait_seconds)
 
-                if self.swallow_exceptions:
-                    logger.warning(
-                        'RateLimiter swallowed an error after %r retries. '
-                        'Called with (*%r, **%r).',
-                        i, args, kwargs, exc_info=True
-                    )
-                    return self.return_value_on_exception
-                else:
-                    raise
-            finally:
-                self._last_call = self._clock()
+        raise RuntimeError("Should not have been reached")
+
+
+class AsyncRateLimiter(BaseRateLimiter):
+    def __init__(self, func, min_delay_seconds=0.0, max_retries=2,
+                 error_wait_seconds=5.0,
+                 swallow_exceptions=True, return_value_on_exception=None):
+        super().__init__(
+            min_delay_seconds=min_delay_seconds,
+            max_retries=max_retries,
+            swallow_exceptions=swallow_exceptions,
+            return_value_on_exception=return_value_on_exception,
+        )
+        self.func = func
+        self.error_wait_seconds = error_wait_seconds
+        assert error_wait_seconds >= min_delay_seconds
+        assert max_retries >= 0
+
+    async def _sleep(self, seconds):  # pragma: no coverage
+        logger.debug(type(self).__name__ + ' sleep(%r)', seconds)
+        await asyncio.sleep(seconds)
+
+    async def _acquire_request_slot(self):
+        for wait in self._acquire_request_slot_gen():
+            await self._sleep(wait)
+
+    async def __call__(self, *args, **kwargs):
+        gen = self._retries_gen(args, kwargs)
+        for _ in gen:
+            await self._acquire_request_slot()
+            try:
+                return await self.func(*args, **kwargs)
+            except self._retry_exceptions as e:
+                if gen.throw(e):
+                    # A final try
+                    return self._handle_exc(args, kwargs)
+                await self._sleep(self.error_wait_seconds)
+
+        raise RuntimeError("Should not have been reached")
